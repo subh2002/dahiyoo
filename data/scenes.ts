@@ -9,10 +9,19 @@ export interface Scene {
   ctaText: string;
 }
 
+const framesCdnBase = process.env.NEXT_PUBLIC_FRAMES_CDN?.replace(/\/+$/, '');
+
+const withFrameBase = (path: string): string => {
+  if (!framesCdnBase) {
+    return path;
+  }
+  return `${framesCdnBase}${path}`;
+};
+
 export const scenes: Scene[] = [
   {
     id: 'hero1',
-    folderPath: '/frames/1 Hero',
+    folderPath: withFrameBase('/frames/1 Hero'),
     totalFrames: 200,
     flavor: 'Strawberry',
     tagline: 'Red. Real. Refreshing.',
@@ -22,7 +31,7 @@ export const scenes: Scene[] = [
   },
   {
     id: 'hero2',
-    folderPath: '/frames/2 Hero',
+    folderPath: withFrameBase('/frames/2 Hero'),
     totalFrames: 51,
     flavor: 'Blueberry',
     tagline: 'Deep. Bold. Unforgettable.',
@@ -32,7 +41,7 @@ export const scenes: Scene[] = [
   },
   {
     id: 'hero3',
-    folderPath: '/frames/3 Hero',
+    folderPath: withFrameBase('/frames/3 Hero'),
     totalFrames: 125,
     flavor: 'Mango',
     tagline: 'Golden. Sweet. Unstoppable.',

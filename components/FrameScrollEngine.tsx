@@ -11,53 +11,151 @@ interface FrameScrollEngineProps {
 export default function FrameScrollEngine({ scene }: FrameScrollEngineProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  
-  const [images, setImages] = useState<HTMLImageElement[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [progress, setProgress] = useState(0);
 
-  // Preload all frames on mount
+  const imagesRef = useRef<Array<HTMLImageElement | null>>([]);
+  const loadedCounterRef = useRef(0);
+  const sceneReadyRef = useRef(false);
+
+  const [loadedCount, setLoadedCount] = useState(0);
+  const [isSceneReady, setIsSceneReady] = useState(false);
+  const [shouldLoad, setShouldLoad] = useState(false);
+
+  const INITIAL_FRAME_COUNT = 16;
+  const LOAD_CONCURRENCY = 8;
+
+  // Start loading when the scene is near the viewport instead of mounting all scenes at once.
   useEffect(() => {
-    if (scene.totalFrames <= 0) {
-      setLoaded(true); // Nothing to load
+    const node = containerRef.current;
+    if (!node) return;
+
+    if (typeof IntersectionObserver === 'undefined') {
+      setShouldLoad(true);
       return;
     }
 
-    let isMounted = true;
-
-    const loadImages = async () => {
-      const promises = [];
-      for (let i = 1; i <= scene.totalFrames; i++) {
-        promises.push(
-          new Promise<HTMLImageElement>((resolve) => {
-            const img = new Image();
-            const frameNum = String(i).padStart(3, '0');
-            img.src = `${scene.folderPath}/ezgif-frame-${frameNum}.jpg`;
-            img.onload = () => {
-              setProgress((prev) => prev + 1);
-              resolve(img);
-            };
-            img.onerror = () => {
-              // Graceful fallback if a frame is missing
-              resolve(img);
-            };
-          })
-        );
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setShouldLoad(true);
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      {
+        root: null,
+        rootMargin: '200% 0px',
+        threshold: 0.01,
       }
-      
-      const loadedImages = await Promise.all(promises);
-      if (isMounted) {
-        setImages(loadedImages);
-        setLoaded(true);
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [scene.id]);
+
+  useEffect(() => {
+    imagesRef.current = [];
+    loadedCounterRef.current = 0;
+    sceneReadyRef.current = false;
+    setLoadedCount(0);
+    setIsSceneReady(false);
+  }, [scene]);
+
+  useEffect(() => {
+    if (!shouldLoad) return;
+
+    if (scene.totalFrames <= 0) {
+      sceneReadyRef.current = true;
+      setIsSceneReady(true);
+      return;
+    }
+
+    let cancelled = false;
+    imagesRef.current = new Array(scene.totalFrames).fill(null);
+
+    const markLoaded = (index: number, img: HTMLImageElement | null) => {
+      imagesRef.current[index] = img;
+      loadedCounterRef.current += 1;
+
+      const count = loadedCounterRef.current;
+      if (count === 1 || count % 4 === 0 || count === scene.totalFrames) {
+        setLoadedCount(count);
+      }
+
+      if (index === 0 && img && !sceneReadyRef.current) {
+        sceneReadyRef.current = true;
+        setIsSceneReady(true);
       }
     };
 
-    loadImages();
+    const loadIndex = (index: number) =>
+      new Promise<void>((resolve) => {
+        const frameNum = String(index + 1).padStart(3, '0');
+        const img = new Image();
+        img.src = `${scene.folderPath}/ezgif-frame-${frameNum}.jpg`;
+
+        img.onload = () => {
+          if (!cancelled) {
+            markLoaded(index, img);
+          }
+          resolve();
+        };
+
+        img.onerror = () => {
+          if (!cancelled) {
+            markLoaded(index, null);
+          }
+          resolve();
+        };
+      });
+
+    const loadWithConcurrency = async (indices: number[], concurrency: number) => {
+      let cursor = 0;
+      const workers = new Array(Math.max(1, concurrency)).fill(null).map(async () => {
+        while (!cancelled) {
+          const current = cursor;
+          cursor += 1;
+          if (current >= indices.length) break;
+          await loadIndex(indices[current]);
+        }
+      });
+
+      await Promise.all(workers);
+    };
+
+    const run = async () => {
+      const initialCount = Math.min(INITIAL_FRAME_COUNT, scene.totalFrames);
+      const initialIndices = Array.from({ length: initialCount }, (_, i) => i);
+      const remainingIndices = Array.from(
+        { length: scene.totalFrames - initialCount },
+        (_, i) => i + initialCount
+      );
+
+      await loadWithConcurrency(initialIndices, LOAD_CONCURRENCY);
+
+      if (!cancelled && !sceneReadyRef.current) {
+        const firstAvailable = imagesRef.current.find(
+          (img) => Boolean(img && img.complete && img.naturalWidth > 0)
+        );
+        if (firstAvailable) {
+          sceneReadyRef.current = true;
+          setIsSceneReady(true);
+        }
+      }
+
+      await loadWithConcurrency(remainingIndices, LOAD_CONCURRENCY);
+      if (!cancelled) {
+        setLoadedCount(loadedCounterRef.current);
+      }
+    };
+
+    run();
 
     return () => {
-      isMounted = false;
+      cancelled = true;
     };
-  }, [scene]);
+  }, [scene, shouldLoad]);
 
   // Handle scroll and canvas drawing
   const { scrollYProgress } = useScroll({
@@ -67,8 +165,35 @@ export default function FrameScrollEngine({ scene }: FrameScrollEngineProps) {
 
   const lastDrawnIndex = useRef<number>(-1);
 
+  const getBestAvailableFrame = (index: number): HTMLImageElement | null => {
+    const exact = imagesRef.current[index];
+    if (exact && exact.complete && exact.naturalWidth > 0) {
+      return exact;
+    }
+
+    for (let distance = 1; distance < scene.totalFrames; distance++) {
+      const left = index - distance;
+      if (left >= 0) {
+        const leftImg = imagesRef.current[left];
+        if (leftImg && leftImg.complete && leftImg.naturalWidth > 0) {
+          return leftImg;
+        }
+      }
+
+      const right = index + distance;
+      if (right < scene.totalFrames) {
+        const rightImg = imagesRef.current[right];
+        if (rightImg && rightImg.complete && rightImg.naturalWidth > 0) {
+          return rightImg;
+        }
+      }
+    }
+
+    return null;
+  };
+
   useAnimationFrame(() => {
-    if (!loaded || images.length === 0 || !canvasRef.current) return;
+    if (!isSceneReady || !canvasRef.current) return;
 
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
@@ -83,10 +208,11 @@ export default function FrameScrollEngine({ scene }: FrameScrollEngineProps) {
 
     // Only draw if index changed
     if (frameIndex !== lastDrawnIndex.current) {
-      lastDrawnIndex.current = frameIndex;
-      const img = images[frameIndex];
+      const img = getBestAvailableFrame(frameIndex);
 
       if (img && img.complete && img.naturalWidth > 0) {
+        lastDrawnIndex.current = frameIndex;
+
         // Set canvas to full window size to prevent blurring
         if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
           canvas.width = window.innerWidth;
@@ -153,13 +279,15 @@ export default function FrameScrollEngine({ scene }: FrameScrollEngineProps) {
         <canvas ref={canvasRef} className="absolute inset-0 z-0 w-full h-full object-contain" />
         
         {/* Loading Progress Bar */}
-        {!loaded && scene.totalFrames > 0 && (
+        {!isSceneReady && scene.totalFrames > 0 && (
           <div className="absolute bottom-10 z-20 flex flex-col items-center">
-            <span className="font-dm-sans text-sm mb-2 text-white/80">Loading frames... {Math.round((progress / scene.totalFrames) * 100)}%</span>
+            <span className="font-dm-sans text-sm mb-2 text-white/80">
+              Loading frames... {Math.round((loadedCount / scene.totalFrames) * 100)}%
+            </span>
             <div className="w-48 h-1 bg-white/20 rounded-full overflow-hidden">
               <div 
                 className="h-full bg-white transition-all duration-300"
-                style={{ width: `${(progress / scene.totalFrames) * 100}%` }}
+                style={{ width: `${(loadedCount / scene.totalFrames) * 100}%` }}
               />
             </div>
           </div>
